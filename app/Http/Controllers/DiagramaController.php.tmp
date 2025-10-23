@@ -1,0 +1,646 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Validator;
+use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Redirect;
+use Illuminate\Support\Facades\Json;
+use App\Models\DiagramaReporte;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Auth;
+use App\Models\Diagrama;
+use ZipArchive;
+use App\Models\UsuarioDiagrama;
+use App\Models\User;
+use Illuminate\Support\Facades\File;
+
+class DiagramaController extends Controller
+{
+    // Métodos necesarios del controlador original
+    public function procesarImagen(Request $request) {}
+
+    public function create()
+    {
+        return view('diagramas.create');
+    }
+
+    public function store(Request $request)
+    {
+        $user = Auth::user();
+        $validated = $request->validate([
+            'nombre' => 'required|string|max:255|unique:diagramas,nombre',
+            'descripcion' => 'nullable|string|max:1000',
+        ]);
+
+        $diagrama = Diagrama::create([
+            'nombre' => $validated['nombre'],
+            'descripcion' => $validated['descripcion'],
+            'contenido' => json_encode(Diagrama::diagramaInicial(), JSON_PRETTY_PRINT)
+        ]);
+
+        DiagramaReporte::crear($user->id, $diagrama->id, Diagrama::diagramaInicial());
+        UsuarioDiagrama::crearRelacion($user->id, $diagrama->id, 'creando diagrama', 'creador');
+        return Redirect::route('diagramas.show', compact('diagrama'));
+    }
+
+    public function show(Diagrama $diagrama)
+    {
+        $diagramaId = $diagrama->id;
+        $ultimoReporte = DiagramaReporte::query()
+            ->where('diagrama_id', $diagrama->id)
+            ->latest()->first();
+        $jsonInicial = json_decode($ultimoReporte->contenido, true);
+        return view('diagramas.uml', compact('jsonInicial', 'diagramaId'));
+    }
+
+    public function updateContenido(Request $request, Diagrama $diagrama)
+    {
+        $validated = $request->validate([
+            'data' => 'required|array'
+        ]);
+
+        $diagrama->update([
+            'contenido' => json_encode($validated['data'], JSON_PRETTY_PRINT)
+        ]);
+
+        return response()->json(['message' => 'Contenido actualizado']);
+    }
+
+    public function uml()
+    {
+        $modeloInicial = [
+            'class' => 'go.GraphLinksModel',
+            'nodeDataArray' => [],
+            'linkDataArray' => []
+        ];
+        $jsonInicial = json_encode($modeloInicial);
+        return view('diagramas.uml', ['jsonInicial' => $jsonInicial]);
+    }
+
+    public function diagramaReporte(Request $request)
+    {
+        try {
+            $user = Auth::user();
+            Log::info('Procesando solicitud de diagrama reporte', ['user_id' => $user->id]);
+
+            $validated = $request->validate([
+                'diagramData' => 'required',
+                'diagramaId' => 'required|exists:diagramas,id'
+            ]);
+
+            $diagramaJson = $validated['diagramData'];
+            $diagramaId = $validated['diagramaId'];
+
+            if (is_string($diagramaJson)) {
+                $diagramaData = json_decode($diagramaJson, true);
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    throw new \Exception('Error al decodificar JSON: ' . json_last_error_msg());
+                }
+            } else {
+                $diagramaData = $diagramaJson;
+            }
+
+            $reporte = DiagramaReporte::crear($user->id, $diagramaId, $diagramaData);
+            Log::info('Diagrama reporte creado exitosamente', ['reporte_id' => $reporte->id]);
+
+            return response()->json([
+                'message' => 'Diagrama guardado correctamente',
+                'reporte_id' => $reporte->id
+            ], 200);
+
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            Log::warning('Error de validación en diagrama reporte', ['errors' => $e->errors()]);
+            return response()->json([
+                'error' => 'Datos inválidos',
+                'details' => $e->errors()
+            ], 422);
+        } catch (\Exception $e) {
+            Log::error('Error al guardar diagrama reporte', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            return response()->json([
+                'error' => 'Error interno del servidor',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    public function destroy($id)
+    {
+        $diagrama = Diagrama::find($id);
+        $diagrama->update(['estado' => false]);
+        return Redirect::route('dashboard');
+    }
+
+    protected function generarApplicationProperties()
+    {
+        return <<<PROPERTIES
+spring.datasource.url=jdbc:h2:mem:testdb
+spring.datasource.driverClassName=org.h2.Driver
+spring.datasource.username=sa
+spring.datasource.password=
+spring.h2.console.enabled=true
+spring.jpa.database-platform=org.hibernate.dialect.H2Dialect
+spring.jpa.hibernate.ddl-auto=create-drop
+server.port=8080
+PROPERTIES;
+    }
+
+    protected function generarPomXml($projectName)
+    {
+        $artifactName = strtolower(str_replace(' ', '-', $projectName));
+        
+        return <<<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" 
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    
+    <groupId>com.example</groupId>
+    <artifactId>$artifactName</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+    <name>$projectName</name>
+    <description>Spring Boot project generated from UML diagram</description>
+    
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>2.7.0</version>
+        <relativePath/>
+    </parent>
+    
+    <properties>
+        <java.version>11</java.version>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+    </properties>
+    
+    <dependencies>
+        <!-- Spring Boot Starters -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        
+        <!-- Base de datos H2 -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        
+        <!-- Lombok para reducir código boilerplate -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        
+        <!-- Testing -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        
+        <!-- Jackson para manejo de JSON -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-core</artifactId>
+            <version>2.13.0</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.13.0</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-annotations</artifactId>
+            <version>2.13.0</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <source>11</source>
+                    <target>11</target>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>1.18.24</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+XML;
+    }
+
+    protected function generarEntidad($node, $basePackage)
+    {
+        // Asegurar que el nombre de la clase esté en PascalCase
+        $className = ucfirst(strtolower($node['name']));
+        $attributes = '';
+        $imports = "import javax.persistence.*;\n";
+        $lombokImports = "import lombok.Getter;\nimport lombok.Setter;\nimport lombok.NoArgsConstructor;\nimport lombok.AllArgsConstructor;\nimport lombok.extern.slf4j.Slf4j;\n";
+        $utilImports = "import java.util.*;\nimport com.fasterxml.jackson.databind.ObjectMapper;\nimport com.fasterxml.jackson.core.JsonProcessingException;\n";
+
+        // Propiedades y métodos iniciales como JSON con escape apropiado
+        $initialProperties = str_replace('"', '\\"', json_encode($node['properties'] ?? []));
+        $initialMethods = str_replace('"', '\\"', json_encode($node['methods'] ?? []));
+
+        return <<<JAVA
+package $basePackage.entity;
+
+$imports
+$lombokImports
+$utilImports
+
+@Entity
+@Table(name = "".strtolower($className)."")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Slf4j
+public class $className {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    // Campos para metadatos de la clase
+    @Column(columnDefinition = "TEXT")
+    private String classProperties = "$initialProperties";
+    
+    @Column(columnDefinition = "TEXT")
+    private String classMethods = "$initialMethods";
+    
+    @Column(length = 50)
+    private String stereotype = "Entity";
+
+    // Campos reales de la entidad
+    private String nombre;
+    private String descripcion;
+
+    // Métodos para manejar propiedades
+    public List<Map<String, String>> getPropertiesList() {
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            return mapper.readValue(classProperties, List.class);
+        } catch (JsonProcessingException e) {
+            log.error("Error deserializando propiedades: {}", e.getMessage());
+            return new ArrayList<>();
+        }
+    }
+
+    public void setPropertiesList(List<Map<String, String>> properties) {
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            this.classProperties = mapper.writeValueAsString(properties);
+        } catch (JsonProcessingException e) {
+            log.error("Error serializando propiedades: {}", e.getMessage());
+            this.classProperties = "[]";
+        }
+    }
+
+    // Métodos para manejar métodos
+    public List<Map<String, String>> getMethodsList() {
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            return mapper.readValue(classMethods, List.class);
+        } catch (JsonProcessingException e) {
+            log.error("Error deserializando métodos: {}", e.getMessage());
+            return new ArrayList<>();
+        }
+    }
+
+    public void setMethodsList(List<Map<String, String>> methods) {
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            this.classMethods = mapper.writeValueAsString(methods);
+        } catch (JsonProcessingException e) {
+            log.error("Error serializando métodos: {}", e.getMessage());
+            this.classMethods = "[]";
+        }
+    }
+
+    // Métodos para manejar relaciones
+    public List<Map<String, String>> getRelationships() {
+        log.debug("Obteniendo relaciones para {}", this.getClass().getSimpleName());
+        return new ArrayList<>();
+    }
+}
+JAVA;
+    }
+
+    protected function generarRepositorio($node, $basePackage)
+    {
+        // Asegurar que el nombre de la clase esté en PascalCase
+        $className = ucfirst(strtolower($node['name']));
+        
+        return <<<JAVA
+package $basePackage.repository;
+
+import $basePackage.entity.$className;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface {$className}Repository extends JpaRepository<$className, Long> {
+}
+JAVA;
+    }
+
+    protected function generarServicio($node, $basePackage)
+    {
+        // Asegurar que el nombre de la clase esté en PascalCase
+        $className = ucfirst(strtolower($node['name']));
+        $varName = lcfirst($className);
+        
+        return <<<JAVA
+package $basePackage.service;
+
+import $basePackage.entity.$className;
+import $basePackage.repository.{$className}Repository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import lombok.extern.slf4j.Slf4j;
+import java.util.List;
+import java.util.Optional;
+
+@Service
+@Slf4j
+public class {$className}Service {
+
+    @Autowired
+    private {$className}Repository {$varName}Repository;
+
+    public List<$className> findAll() {
+        return {$varName}Repository.findAll();
+    }
+
+    public Optional<$className> findById(Long id) {
+        return {$varName}Repository.findById(id);
+    }
+
+    public $className save($className $varName) {
+        return {$varName}Repository.save($varName);
+    }
+
+    public void deleteById(Long id) {
+        {$varName}Repository.deleteById(id);
+    }
+}
+JAVA;
+    }
+
+    protected function generarControlador($node, $basePackage)
+    {
+        // Asegurar que el nombre de la clase esté en PascalCase
+        $className = ucfirst(strtolower($node['name']));
+        $varName = lcfirst($className);
+        
+        return <<<JAVA
+package $basePackage.controller;
+
+import $basePackage.entity.$className;
+import $basePackage.service.{$className}Service;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import lombok.extern.slf4j.Slf4j;
+import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+
+@RestController
+@RequestMapping("/api/$varName")
+@Slf4j
+public class {$className}Controller {
+
+    @Autowired
+    private {$className}Service {$varName}Service;
+
+    @GetMapping
+    public List<$className> findAll() {
+        return {$varName}Service.findAll();
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<$className> findById(@PathVariable Long id) {
+        return {$varName}Service.findById(id)
+            .map(ResponseEntity::ok)
+            .orElse(ResponseEntity.notFound().build());
+    }
+
+    @PostMapping
+    public ResponseEntity<$className> create(@RequestBody $className $varName) {
+        try {
+            $className saved = {$varName}Service.save($varName);
+            return ResponseEntity.ok(saved);
+        } catch (Exception e) {
+            log.error("Error creating $className: {}", e.getMessage());
+            return ResponseEntity.badRequest().build();
+        }
+    }
+
+    @PutMapping("/{id}")
+    public ResponseEntity<$className> update(@PathVariable Long id, @RequestBody $className $varName) {
+        if (!{$varName}Service.findById(id).isPresent()) {
+            return ResponseEntity.notFound().build();
+        }
+        $varName.setId(id);
+        return ResponseEntity.ok({$varName}Service.save($varName));
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> delete(@PathVariable Long id) {
+        if (!{$varName}Service.findById(id).isPresent()) {
+            return ResponseEntity.notFound().build();
+        }
+        {$varName}Service.deleteById(id);
+        return ResponseEntity.noContent().build();
+    }
+
+    // Endpoints específicos para el diagrama
+    @GetMapping("/{id}/properties")
+    public ResponseEntity<List<Map<String, String>>> getProperties(@PathVariable Long id) {
+        return {$varName}Service.findById(id)
+            .map(entity -> ResponseEntity.ok(entity.getPropertiesList()))
+            .orElse(ResponseEntity.notFound().build());
+    }
+
+    @PutMapping("/{id}/properties")
+    public ResponseEntity<?> updateProperties(
+            @PathVariable Long id,
+            @RequestBody List<Map<String, String>> properties) {
+        return {$varName}Service.findById(id)
+            .map(entity -> {
+                entity.setPropertiesList(properties);
+                return ResponseEntity.ok({$varName}Service.save(entity));
+            })
+            .orElse(ResponseEntity.notFound().build());
+    }
+
+    @GetMapping("/{id}/methods")
+    public ResponseEntity<List<Map<String, String>>> getMethods(@PathVariable Long id) {
+        return {$varName}Service.findById(id)
+            .map(entity -> ResponseEntity.ok(entity.getMethodsList()))
+            .orElse(ResponseEntity.notFound().build());
+    }
+
+    @PutMapping("/{id}/methods")
+    public ResponseEntity<?> updateMethods(
+            @PathVariable Long id,
+            @RequestBody List<Map<String, String>> methods) {
+        return {$varName}Service.findById(id)
+            .map(entity -> {
+                entity.setMethodsList(methods);
+                return ResponseEntity.ok({$varName}Service.save(entity));
+            })
+            .orElse(ResponseEntity.notFound().build());
+    }
+
+    @GetMapping("/{id}/relationships")
+    public ResponseEntity<List<Map<String, String>>> getRelationships(@PathVariable Long id) {
+        return {$varName}Service.findById(id)
+            .map(entity -> ResponseEntity.ok(entity.getRelationships()))
+            .orElse(ResponseEntity.notFound().build());
+    }
+}
+JAVA;
+    }
+
+    public function exportSpringboot($id)
+    {
+        try {
+            $diagrama = Diagrama::findOrFail($id);
+            $ultimoReporte = DiagramaReporte::where('diagrama_id', $id)
+                ->latest()
+                ->firstOrFail();
+
+            $diagramData = json_decode($ultimoReporte->contenido, true);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                throw new \Exception('Error al decodificar el JSON del diagrama');
+            }
+
+            // Crear archivos del proyecto Spring Boot
+            $zip = new ZipArchive();
+            $zipFileName = storage_path('app/' . $diagrama->nombre . '_springboot.zip');
+
+            if ($zip->open($zipFileName, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== TRUE) {
+                throw new \Exception('No se pudo crear el archivo ZIP');
+            }
+
+            try {
+                $basePackage = "com.example." . strtolower(str_replace(' ', '', $diagrama->nombre));
+                
+                // 1. Crear estructura de directorios base
+                $structure = [
+                    'src/main/java/' . str_replace('.', '/', $basePackage) . '/',
+                    'src/main/java/' . str_replace('.', '/', $basePackage) . '/entity/',
+                    'src/main/java/' . str_replace('.', '/', $basePackage) . '/repository/',
+                    'src/main/java/' . str_replace('.', '/', $basePackage) . '/service/',
+                    'src/main/java/' . str_replace('.', '/', $basePackage) . '/controller/',
+                    'src/main/java/' . str_replace('.', '/', $basePackage) . '/schema/',
+                    'src/main/resources/',
+                    'src/test/java/' . str_replace('.', '/', $basePackage) . '/'
+                ];
+                
+                foreach ($structure as $dir) {
+                    $zip->addEmptyDir($dir);
+                }
+                
+                $basePath = "src/main/java/" . str_replace('.', '/', $basePackage);
+                
+                // 2. Procesar cada nodo del diagrama
+                foreach ($diagramData['nodeDataArray'] as $node) {
+                    if (isset($node['name'])) {
+                        $className = $node['name'];
+                        
+                        // 2.1 Generar entidad
+                        $zip->addFromString(
+                            "$basePath/entity/$className.java",
+                            $this->generarEntidad($node, $basePackage)
+                        );
+                        
+                        // 2.2 Generar repositorio
+                        $zip->addFromString(
+                            "$basePath/repository/{$className}Repository.java",
+                            $this->generarRepositorio($node, $basePackage)
+                        );
+                        
+                        // 2.3 Generar servicio
+                        $zip->addFromString(
+                            "$basePath/service/{$className}Service.java",
+                            $this->generarServicio($node, $basePackage)
+                        );
+                        
+                        // 2.4 Generar controlador
+                        $zip->addFromString(
+                            "$basePath/controller/{$className}Controller.java",
+                            $this->generarControlador($node, $basePackage)
+                        );
+                    }
+                }
+                
+                // 3. Generar archivos de configuración
+                $zip->addFromString(
+                    "src/main/resources/application.properties",
+                    $this->generarApplicationProperties()
+                );
+                
+                $zip->addFromString(
+                    "pom.xml",
+                    $this->generarPomXml($diagrama->nombre)
+                );
+                
+                $zip->close();
+
+                return response()->download($zipFileName)->deleteFileAfterSend(true);
+            } catch (\Exception $e) {
+                $zip->close();
+                if (file_exists($zipFileName)) {
+                    unlink($zipFileName);
+                }
+                throw $e;
+            }
+        } catch (\Exception $e) {
+            Log::error('Error exportando Spring Boot', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            return redirect()->back()->with('error', 'Error al exportar el diagrama: ' . $e->getMessage());
+        }
+    }
+}
